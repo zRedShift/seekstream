@@ -158,8 +158,10 @@ func (f *File) Seek(off int64, whence int) (int64, error) {
 
 // DoneWriting closes the File for writing, closing the notification channel, automatically clearing all blocks.
 func (f *File) DoneWriting() {
-	f.done = true
-	close(f.ready)
+	if !f.done {
+		f.done = true
+		close(f.ready)
+	}
 }
 
 // ReadFrom implements the ReaderFrom interface. Uses the input's WriterTo interface if available.
@@ -223,9 +225,7 @@ func (f *File) Close() error {
 		return nil
 	}
 
-	if !f.done {
-		f.DoneWriting()
-	}
+	f.DoneWriting()
 
 	err := f.file.Close()
 	if err != nil {
@@ -238,8 +238,7 @@ func (f *File) Close() error {
 
 // Move moves the temporary file to the new path.
 func (f *File) Move(path string) error {
-	err := f.Close()
-	if err != nil {
+	if err := f.Close(); err != nil {
 		return err
 	}
 
@@ -248,8 +247,7 @@ func (f *File) Move(path string) error {
 
 // Remove removes the temporary file.
 func (f *File) Remove() error {
-	err := f.Close()
-	if err != nil {
+	if err := f.Close(); err != nil {
 		return err
 	}
 
