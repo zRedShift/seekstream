@@ -208,6 +208,11 @@ func (f *File) Wait() {
 	}
 }
 
+// IsDone returns whether DoneWriting was called on the File
+func (f *File) IsDone() bool {
+	return f.done
+}
+
 // Name returns the temporary file's path.
 func (f *File) Name() string {
 	return f.file.Name()

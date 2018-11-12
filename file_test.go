@@ -39,6 +39,9 @@ func TestNewFile(t *testing.T) {
 			}
 
 			f.DoneWriting()
+			if done := f.IsDone(); done != true {
+				t.Errorf("File.IsDone() = %v, want %v", done, true)
+			}
 
 			if f.Size() != 0 {
 				t.Errorf("File.Size() = %v, want %v", f.Size(), 0)
