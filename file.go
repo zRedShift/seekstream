@@ -3,28 +3,20 @@
 package seekstream
 
 import (
-	"errors"
 	"io"
 	"io/ioutil"
 	"os"
+	"sync/atomic"
 )
 
 // bufSize is the default buffer size of io.copyBuffer.
 const bufSize = 1 << 15
 
-var (
-	errDoneWriting   = errors.New("already done writing")
-	errAlreadyClosed = errors.New("file already closed")
-	errInvalidOffset = errors.New("invalid offset")
-	errInvalidWhence = errors.New("seek: invalid whence")
-)
-
 // File is the seekable streaming data in the form of a file. Initialised using NewFile.
 type File struct {
-	file         *os.File
-	r, w         int64
-	done, closed bool
-	ready        chan struct{}
+	file       *os.File
+	r, w       int64
+	done, wait chan struct{}
 }
 
 // NewFile creates a new temporary file in the (optionally provided) directory and returns an empty File.
@@ -40,38 +32,44 @@ func NewFile(tempDir ...string) (*File, error) {
 	}
 
 	return &File{
-		file:  file,
-		ready: make(chan struct{}),
+		file: file,
+		done: make(chan struct{}),
+		wait: make(chan struct{}),
 	}, nil
 }
 
-// Write implements the io.Writer interface and unblocks the File for reading.
+func (f *File) notify() {
+	for {
+		select {
+		case <-f.wait:
+
+		default:
+			return
+		}
+	}
+}
+
+// Write implements the io.Writer interface and notifies all the blocked readers after each write.
 func (f *File) Write(p []byte) (int, error) {
-	if f.done {
-		return 0, errDoneWriting
+	if f.IsDone() {
+		return 0, &os.PathError{Op: "write", Path: f.Name(), Err: os.ErrClosed}
 	}
 
 	n, err := f.file.WriteAt(p, f.w)
-	f.w += int64(n)
+	atomic.AddInt64(&f.w, int64(n))
 
-	select {
-	case f.ready <- struct{}{}:
-
-	default:
-
-	}
+	f.notify()
 
 	return n, err
 }
 
 // Read implements the io.Reader interface and only blocks in the case of a (0, nil) Read.
 func (f *File) Read(p []byte) (int, error) {
-	err := f.readCommon(f.r)
-	if err != nil {
-		return 0, err
+	if !f.block(f.r) {
+		return 0, io.EOF
 	}
 
-	p = subSlice(p, int(f.w-f.r))
+	p = subSlice(p, int(atomic.LoadInt64(&f.w)-f.r))
 
 	n, err := f.file.Read(p)
 	f.r += int64(n)
@@ -80,22 +78,26 @@ func (f *File) Read(p []byte) (int, error) {
 
 // ReadAt implements the ReaderAt interface, blocking until the buffer is filled or the EOF reached.
 func (f *File) ReadAt(p []byte, off int64) (int, error) {
-	err := f.readCommon(off)
-	if err != nil {
-		return 0, err
+	if !f.block(off) {
+		return 0, io.EOF
 	}
 
-	pLen := len(p)
+	var (
+		err  error
+		pLen = len(p)
+	)
+
 	for {
-		var n int
-		n, err = f.file.ReadAt(subSlice(p, int(f.w-off)), off)
+		n := 0
+		n, err = f.file.ReadAt(subSlice(p, int(atomic.LoadInt64(&f.w)-off)), off)
 		p = p[n:]
 		off += int64(n)
 		if err != nil || len(p) == 0 {
 			break
 		}
 
-		if err = f.block(off); err != nil {
+		if !f.block(off) {
+			err = io.EOF
 			break
 		}
 	}
@@ -103,76 +105,48 @@ func (f *File) ReadAt(p []byte, off int64) (int, error) {
 	return pLen - len(p), err
 }
 
-func (f *File) readCommon(off int64) error {
-	switch {
-	case f.closed:
-		return errAlreadyClosed
+func (f *File) block(off int64) bool {
+	for off >= atomic.LoadInt64(&f.w) {
+		select {
+		case <-f.done:
+			return off < f.w
 
-	case off < 0:
-		return errInvalidOffset
-
-	}
-
-	return f.block(off)
-}
-
-func (f *File) block(off int64) error {
-	for off >= f.w {
-		if f.done {
-			return io.EOF
+		case f.wait <- struct{}{}:
 		}
-		<-f.ready
 	}
 
-	return nil
+	return true
 }
 
-// Seek implements the io.Seeker interface, blocking when the requested offset/whence combination hasn't been written
-// yet, or is unknowable.
+// Seek implements the io.Seeker interface, blocking until file size is known if the whence is io.SeekEnd.
 func (f *File) Seek(off int64, whence int) (int64, error) {
-	var newPos int64
 	var err error
 
-	switch whence {
-	default:
-		return 0, errInvalidWhence
-
-	case io.SeekStart:
-		newPos = off
-
-	case io.SeekCurrent:
-		newPos = f.r + off
-
-	case io.SeekEnd:
-		newPos = 1<<63 - 1
-
-	}
-
-	for !f.done && f.w < newPos {
-		<-f.ready
+	if whence == io.SeekEnd {
+		f.Wait()
 	}
 
 	f.r, err = f.file.Seek(off, whence)
 	return f.r, err
 }
 
-// DoneWriting closes the File for writing, closing the notification channel, automatically clearing all blocks.
+// DoneWriting closes the File for writing.
 func (f *File) DoneWriting() {
-	if !f.done {
-		f.done = true
-		close(f.ready)
+	select {
+	case <-f.done:
+
+	default:
+		close(f.done)
 	}
 }
 
-// ReadFrom implements the ReaderFrom interface. Uses the input's WriterTo interface if available.
+// ReadFrom implements the ReaderFrom interface.
 func (f *File) ReadFrom(r io.Reader) (int64, error) {
-	var err error
+	var (
+		err      error
+		startPos = atomic.LoadInt64(&f.w)
+	)
 
-	if wt, ok := r.(io.WriterTo); ok {
-		return wt.WriteTo(f)
-	}
-
-	startPos := f.w
 	buf := make([]byte, bufSize)
 
 	for {
@@ -198,19 +172,23 @@ func (f *File) ReadFrom(r io.Reader) (int64, error) {
 		}
 	}
 
-	return f.w - startPos, err
+	return atomic.LoadInt64(&f.w) - startPos, err
 }
 
 // Wait blocks until the File is closed for writing.
 func (f *File) Wait() {
-	for !f.done {
-		<-f.ready
-	}
+	<-f.done
 }
 
-// IsDone returns whether DoneWriting was called on the File
+// IsDone returns whether DoneWriting was called on the File.
 func (f *File) IsDone() bool {
-	return f.done
+	select {
+	case <-f.done:
+		return true
+
+	default:
+		return false
+	}
 }
 
 // Name returns the temporary file's path.
@@ -226,25 +204,17 @@ func (f *File) Size() int64 {
 
 // Close closes the temporary file.
 func (f *File) Close() error {
-	if f.closed {
-		return nil
-	}
-
 	f.DoneWriting()
 
-	err := f.file.Close()
-	if err != nil {
-		return err
-	}
-
-	f.closed = true
-	return nil
+	return f.file.Close()
 }
 
 // Move moves the temporary file to the new path.
 func (f *File) Move(path string) error {
 	if err := f.Close(); err != nil {
-		return err
+		if pErr, ok := err.(*os.PathError); !ok || pErr.Err != os.ErrClosed {
+			return err
+		}
 	}
 
 	return os.Rename(f.file.Name(), path)
@@ -253,7 +223,9 @@ func (f *File) Move(path string) error {
 // Remove removes the temporary file.
 func (f *File) Remove() error {
 	if err := f.Close(); err != nil {
-		return err
+		if pErr, ok := err.(*os.PathError); !ok || pErr.Err != os.ErrClosed {
+			return err
+		}
 	}
 
 	return os.Remove(f.file.Name())

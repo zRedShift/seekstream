@@ -1,13 +1,13 @@
-// Package seekstream provides a way to treat streaming data as if it were a regular file, blocking until more data is
-// available or the end is reached.
 package seekstream
 
 import (
 	"bytes"
 	"crypto/rand"
+	"errors"
 	"io"
 	"io/ioutil"
 	"os"
+	"reflect"
 	"testing"
 	"testing/iotest"
 )
@@ -34,12 +34,13 @@ func TestNewFile(t *testing.T) {
 				return
 			}
 
-			if _, err = f.ReadAt([]byte{0}, -1); err != errInvalidOffset {
-				t.Errorf("File.ReadAt() error = %v, want %v", err, errInvalidOffset)
+			wantErr := &os.PathError{Op: "readat", Path: f.Name(), Err: errors.New("negative offset")}
+			if _, err = f.ReadAt([]byte{0}, -1); !reflect.DeepEqual(err, wantErr) {
+				t.Errorf("File.ReadAt() error = %v, want %v", err, wantErr)
 			}
 
 			f.DoneWriting()
-			if done := f.IsDone(); done != true {
+			if done := f.IsDone(); !done {
 				t.Errorf("File.IsDone() = %v, want %v", done, true)
 			}
 
@@ -51,8 +52,9 @@ func TestNewFile(t *testing.T) {
 				t.Errorf("File.ReadAt() error = %v, want %v", err, io.EOF)
 			}
 
-			if _, err = f.Write([]byte{0}); err != errDoneWriting {
-				t.Errorf("File.Write() error = %v, want %v", err, errDoneWriting)
+			wantErr = &os.PathError{Op: "write", Path: f.Name(), Err: os.ErrClosed}
+			if _, err = f.Write([]byte{0}); !reflect.DeepEqual(err, wantErr) {
+				t.Errorf("File.Write() error = %v, want %v", err, wantErr)
 			}
 
 			if err = f.Remove(); err != nil {
@@ -74,7 +76,6 @@ func TestFile_ReadFrom(t *testing.T) {
 		{"dataErrReader", iotest.DataErrReader(io.LimitReader(rand.Reader, 1<<10)), 1 << 10, false},
 		{"timeoutReader", iotest.TimeoutReader(io.LimitReader(rand.Reader, 1<<10)), 1 << 10, true},
 		{"halfReader", iotest.HalfReader(io.LimitReader(rand.Reader, 1<<10)), 1 << 10, false},
-		{"writerTo", bytes.NewReader(make([]byte, 1<<6)), 1 << 6, false},
 	}
 
 	for _, test := range tests {
@@ -168,7 +169,7 @@ func prepareFiles(t *testing.T) (*os.File, *File) {
 
 func TestFile_ReadAt(t *testing.T) {
 	const bufSize = 1 << 20
-	buf1, buf2 := make([]byte, bufSize), make([]byte, bufSize)
+	buf1, buf2, buf3 := make([]byte, bufSize), make([]byte, bufSize), make([]byte, bufSize*2)
 
 	tempFile, f := prepareFiles(t)
 	defer func() {
@@ -187,6 +188,11 @@ func TestFile_ReadAt(t *testing.T) {
 	nf, err := f.ReadAt(buf1, 0)
 	if err != nil || nf != bufSize {
 		t.Errorf("File.ReadAt() = (%v, %v), want (%v, %v)", nf, err, bufSize, error(nil))
+	}
+
+	nb, err := f.ReadAt(buf3, 0)
+	if err != io.EOF || nb != bufSize {
+		t.Errorf("File.ReadAt() = (%v, %v), want (%v, %v)", nb, err, bufSize, io.EOF)
 	}
 
 	nt, err := tempFile.ReadAt(buf2, 0)
@@ -260,25 +266,62 @@ func TestFile_Move(t *testing.T) {
 		t.Errorf("os.Remove() error = %v", err)
 	}
 
-	if err = f.Move(f.Name()); err != nil {
+	if err = f.Move(f.Name() + "_"); err != nil {
 		t.Errorf("File.Move() error = %v", err)
+	}
+
+	if err = f.Move(f.Name()); err == nil {
+		t.Errorf("File.Move() error = %v, wantErr %v", err, true)
+	}
+
+	if err = f.Remove(); err == nil {
+		t.Errorf("File.Remove() error = %v, wantErr %v", err, true)
+	}
+
+	if err = os.Rename(f.file.Name()+"_", f.file.Name()); err != nil {
+		t.Errorf("os.Rename() error = %v", err)
 	}
 
 	if err = f.Remove(); err != nil {
 		t.Errorf("File.Remove() error = %v", err)
 	}
 
-	if _, err = f.Read([]byte{}); err != errAlreadyClosed {
-		t.Errorf("File.Read() error = %v, want %v", err, errAlreadyClosed)
+	wantErr := &os.PathError{Op: "read", Path: f.Name(), Err: os.ErrClosed}
+
+	if _, err = f.Read([]byte{}); !reflect.DeepEqual(err, wantErr) {
+		t.Errorf("File.Read() error = %v, want %v", err, wantErr)
 	}
 
-	f.ready, f.done, f.closed = make(chan struct{}), false, false
+	f.done = make(chan struct{})
 	if err = f.Remove(); err == nil {
 		t.Errorf("File.Remove() error = %v, wantErr %v", err, true)
 	}
 
-	f.ready, f.done, f.closed = make(chan struct{}), false, false
+	f.done = make(chan struct{})
 	if err = f.Move(f.Name()); err == nil {
 		t.Errorf("File.Move() error = %v, wantErr %v", err, true)
+	}
+}
+
+func TestFile_nil(t *testing.T) {
+	var (
+		f = &File{
+			done: make(chan struct{}),
+			wait: make(chan struct{}),
+		}
+		n   int64
+		err error
+	)
+
+	if n, err = f.ReadFrom(rand.Reader); err != os.ErrInvalid || n != 0 {
+		t.Errorf("File.ReadFrom() = (%v, %v), want (%v, %v)", n, err, 0, os.ErrInvalid)
+	}
+
+	if err = f.Move(""); err != os.ErrInvalid {
+		t.Errorf("File.Move() error = %v, wantErr %v", err, os.ErrInvalid)
+	}
+
+	if err = f.Remove(); err != os.ErrInvalid {
+		t.Errorf("File.Remove() error = %v, wantErr %v", err, os.ErrInvalid)
 	}
 }
